@@ -17,6 +17,6 @@ pip install -r requiement.txt
 
 # Tutorials
 We provide three step by step tutorals as follows:
-Tutorial 1: Integrating two DLPFC slices (10x Visium)
-Tutorial 2: Integrating two MOB slices across sequencing platforms (Slide-seqV2 and Stereo-seq)
-Tutorial 3: Integrating two mouse embryo slices from different platforms.
+* Tutorial 1: Integrating two DLPFC slices (10x Visium)
+* Tutorial 2: Integrating two MOB slices across sequencing platforms (Slide-seqV2 and Stereo-seq)
+* Tutorial 3: Integrating two mouse embryo slices from different platforms.
