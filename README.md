@@ -12,7 +12,7 @@ Then create a conda environment for Tacos and install all the required packages:
 ```
 conda create -n env_tacos python=3.10
 conda activate env_tacos
-pip install -r requiement.txt
+pip install -r requirement.txt
 ```
 
 # Tutorials
