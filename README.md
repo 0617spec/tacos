@@ -4,7 +4,8 @@ Here, we take two spatial transcriptomics data as an example. Tacos treats these
 # Installation
 The Tacos is developed based on the Python libraries Scanpy, PyTorch and PyG (PyTorch Geometric) framework, and can be run on GPU (recommend) or CPU.
 
-First, download the code to your local machine (you can download the zip file using the download button in the top-right corner, or use `git clone https://github.com/0617spec/tacos.git`).
+First, download the code to your local machine 
+You can download the zip file using the download button in the top-right corner, or use `git clone https://github.com/0617spec/tacos.git` (It may fail in cloning an anonymous git repository. We recommend download directly in an anonymous link.)
 
 After extracting the files, create a conda environment and install all necessary packages.
 
