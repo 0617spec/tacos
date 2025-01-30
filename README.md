@@ -38,6 +38,11 @@ Next, load the raw adata data and perform preprocessing.
 We put all adata into one list.
 ```python
 from model import process_adata,integrate_datasets
+load_list=['151508','151675']
+adata_list = []
+MARKER_GENES = ['VIM','HPCAL1','CARTPT','RORB','PCP4','KRT17','MBP'] # optional
+file_dir = './data/'
+
 for section_id in load_list:
     ### read adata
     input_dir = file_dir+section_id
@@ -59,7 +64,7 @@ for section_id in load_list:
 ```
 Then integrate all datasets into one concated adata:
 ```python
-# Integrate all samples
+# Integrate all samples, get intersection gene of all slice
 combined_adata = integrate_datasets(adata_list, load_list)
 ```
 Start trainning:
@@ -109,4 +114,4 @@ It will return an adata with Tacos result in ```.obsm```
 from model import visualize_embeddings
 adata_emb = visualize_embeddings(combined_adata, tacos.embedding,true_label_key='layer_guess_reordered')
 ```
-Tshe adata containing tacos result can be used for downstream analysis.
+The adata containing tacos result can be used for downstream analysis.
