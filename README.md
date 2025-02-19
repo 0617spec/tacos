@@ -135,3 +135,4 @@ sc.pl.spatial(adata_emb[adata_emb.obs['batch'] == '151674'], color=["PCP4"],
               legend_fontsize=10, show=True, frameon=False, spot_size=150, legend_loc='right margin')
 ```
 ![alt text](image-3.png)
+Other downstream analysis can be done by Scanpy package or Squidpy package.
