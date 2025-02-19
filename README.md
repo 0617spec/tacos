@@ -9,11 +9,20 @@ You can download the zip file using the download button in the top-right corner,
 
 After extracting the files, create a conda environment and install all necessary packages.
 
+
+First, download the code to your local machine 
+You can download the zip file using the download button in the top-right corner, or use `git clone https://github.com/0617spec/tacos.git` (It may fail in cloning an anonymous git repository. We recommend download directly in an anonymous link.)
+
+After extracting the files, create a conda environment and install all necessary packages.
+
 ```
 conda create -n env_tacos python=3.10
 conda activate env_tacos
 pip install -r requirement.txt
 ```
+
+It is recommended to place the training `ipynb` file at the same level as the `model` folder.
+
 
 It is recommended to place the training `ipynb` file at the same level as the `model` folder.
 

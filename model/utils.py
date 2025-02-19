@@ -21,7 +21,74 @@ import random
 from typing import List
 
 from sklearn.neighbors import NearestNeighbors,kneighbors_graph
+import scipy.sparse as sp
+from torch_geometric.data import Data
+from torch_geometric.utils import to_networkx
+import anndata as ad
+import scanpy as sc
+import pandas as pd
+from annoy import AnnoyIndex
+import hnswlib
+import os
+from joblib import Parallel, delayed
+import itertools
+import random
+from typing import List
+
+from sklearn.neighbors import NearestNeighbors,kneighbors_graph
 import scipy
+
+import rpy2.robjects as robjects
+import rpy2.robjects.numpy2ri
+
+def mclust_R(adata, num_cluster, modelNames='EII', used_obsm='spamc', random_seed=42):
+    """
+    Clustering using the mclust algorithm.
+    The parameters are the same as those in the R package mclust.
+    """
+
+    np.random.seed(random_seed)
+    # import rpy2.robjects as robjects
+    robjects.r.library("mclust")
+
+    # import rpy2.robjects.numpy2ri
+    rpy2.robjects.numpy2ri.activate()
+    r_random_seed = robjects.r['set.seed']
+    r_random_seed(random_seed)
+    rmclust = robjects.r['Mclust']
+
+    res = rmclust(adata.obsm[used_obsm], num_cluster, modelNames)
+    mclust_res = np.array(res[-2])
+
+    adata.obs['mclust'] = mclust_res
+    adata.obs['mclust'] = adata.obs['mclust'].astype('int')
+    adata.obs['mclust'] = adata.obs['mclust'].astype('category')
+    
+def match_cluster_labels(true_labels,est_labels):
+    true_labels_arr = np.array(list(true_labels))
+    est_labels_arr = np.array(list(est_labels))
+    org_cat = list(np.sort(list(pd.unique(true_labels))))
+    est_cat = list(np.sort(list(pd.unique(est_labels))))
+    B = nx.Graph()
+    B.add_nodes_from([i+1 for i in range(len(org_cat))], bipartite=0)
+    B.add_nodes_from([-j-1 for j in range(len(est_cat))], bipartite=1)
+    for i in range(len(org_cat)):
+        for j in range(len(est_cat)):
+            weight = np.sum((true_labels_arr==org_cat[i])* (est_labels_arr==est_cat[j]))
+            B.add_edge(i+1,-j-1, weight=-weight)
+    match = nx.algorithms.bipartite.matching.minimum_weight_full_matching(B)
+#     match = minimum_weight_full_matching(B)
+    if len(org_cat)>=len(est_cat):
+        return np.array([match[-est_cat.index(c)-1]-1 for c in est_labels_arr])
+    else:
+        unmatched = [c for c in est_cat if not (-est_cat.index(c)-1) in match.keys()]
+        l = []
+        for c in est_labels_arr:
+            if (-est_cat.index(c)-1) in match: 
+                l.append(match[-est_cat.index(c)-1]-1)
+            else:
+                l.append(len(org_cat)+unmatched.index(c))
+        return np.array(l)
 
 import rpy2.robjects as robjects
 import rpy2.robjects.numpy2ri
@@ -574,6 +641,43 @@ def mnn_multi(ds1, ds2, names1, names2, knn=20, save_on_disk=True, approx=True, 
     mutual = match1 & set([(b, a) for a, b in match2])
 
     return mutual
+def mnn_multi(ds1, ds2, names1, names2, knn=20, save_on_disk=True, approx=True, n_jobs=1):
+    # print(ds1.shape)
+    # print(ds2.shape)
+    # for ds1_chunk in np.array_split(ds1, n_jobs):
+    # #     print(ds1_chunk.shape)
+    print(f'use {n_jobs} cpu')
+    if approx:
+        # 并行计算最近邻匹配
+        match1 = Parallel(n_jobs=n_jobs)(
+            delayed(nn_approx)(ds1_chunk, ds2, names1_chunk, names2, knn=knn)
+            for ds1_chunk,names1_chunk in zip( np.array_split(ds1, n_jobs),np.array_split(names1, n_jobs))
+        )
+        match1 = set().union(*match1)  # 合并结果
+        # print(match1[])
+
+        match2 = Parallel(n_jobs=n_jobs)(
+            delayed(nn_approx)(ds2_chunk, ds1, names2_chunk, names1, knn=knn)
+            for ds2_chunk,names2_chunk in zip( np.array_split(ds2, n_jobs),np.array_split(names2, n_jobs))
+        )
+        match2 = set().union(*match2)  # 合并结果
+    else:
+        match1 = Parallel(n_jobs=n_jobs)(
+            delayed(nn)(ds1_chunk, ds2, names1_chunk, names2, knn=knn)
+            for ds1_chunk,names1_chunk in zip( np.array_split(ds1, n_jobs),np.array_split(names1, n_jobs))
+        )
+        match1 = set().union(*match1)  # 合并结果
+
+        match2 = Parallel(n_jobs=n_jobs)(
+            delayed(nn)(ds2_chunk, ds1, names2_chunk, names1, knn=knn)
+            for ds2_chunk,names2_chunk in zip( np.array_split(ds2, n_jobs),np.array_split(names2, n_jobs))
+        )
+        match2 = set().union(*match2)  # 合并结果
+
+    # Compute mutual nearest neighbors
+    mutual = match1 & set([(b, a) for a, b in match2])
+
+    return mutual
 
 def mnn(ds1, ds2, names1, names2, knn = 20, save_on_disk = True, approx = True):
     if approx:
@@ -581,6 +685,7 @@ def mnn(ds1, ds2, names1, names2, knn = 20, save_on_disk = True, approx = True):
         # output KNN point for each point in ds1.  match1 is a set(): (points in names1, points in names2), the size of the set is ds1.shape[0]*knn
         match1 = nn_approx(ds1, ds2, names1, names2, knn=knn)#, save_on_disk = save_on_disk)
         # Find nearest neighbors in second direction.
+        print(type(match1))
         print(type(match1))
         match2 = nn_approx(ds2, ds1, names2, names1, knn=knn)#, save_on_disk = save_on_disk)
     else:
@@ -591,6 +696,43 @@ def mnn(ds1, ds2, names1, names2, knn = 20, save_on_disk = True, approx = True):
 
     return mutual
 
+
+def update_mnn(adata,n_list,embedding:Optional[np.ndarray] = None,path=None,k=50,cpu=1):
+    
+
+    if embedding is None:
+        n1 = n_list[0]
+        n_rest = 0
+        for i in n_list[1:]:
+            n_rest+=i
+        n2 = n_rest
+        if os.path.isfile(path+'mg_total.npy'):
+            mg_total = np.load(path+'mg_total.npy')
+            adata.obsm['Agg']= mg_total
+            print('load agg')
+        # adata_new = adata
+        if adata.obsm.get('Agg') is None:
+            sc.pp.neighbors(adata)  #计算观测值的邻域图
+            snn1 = adata.obsp['connectivities'].todense()
+            snn1_g = snn1[0:n1,0:n1]
+            snn2_g = snn1[n1:(n1+n2),n1:(n1+n2)]
+            # detect similarity corresponding spots with similar expression the same type use MNN.
+            # MNN is computed on the spatially smoothed level
+            # based on original gene expression
+            # spatially smoothed gene expression
+            # n_neighbor = 10
+            if isinstance(adata.X, np.ndarray):
+                embedding = adata.X
+            else:
+                embedding = adata.X.todense()
+            X1 = embedding[0:n1,:].copy()
+            X2 = embedding[n1:,:].copy()
+            X1_mg = X1.copy()
+            for i in range(n1):
+                # detect non-zero of snn1_g
+                index_i = snn1_g[i,:].argsort().A[0]
+                index_i = index_i[(n1-10):n1]
+                X1_mg[i,:] = X1[index_i,:].mean(0)
 
 def update_mnn(adata,n_list,embedding:Optional[np.ndarray] = None,path=None,k=50,cpu=1):
     
