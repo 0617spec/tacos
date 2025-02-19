@@ -1,26 +1,79 @@
-from sklearn.metrics.pairwise import rbf_kernel, euclidean_distances
 from sklearn.neighbors import NearestNeighbors,kneighbors_graph
-from intervaltree import IntervalTree
-import operator
-import numpy as np
-from annoy import AnnoyIndex
-import itertools
 import networkx as nx
-import hnswlib
-import pandas as pd
-import scanpy as sc
-import anndata as ad
-from scipy import sparse
-from typing import Sequence
-from cdlib.utils import convert_graph_formats
-from cdlib import algorithms
-import torch
 import gudhi
-from scipy.spatial import distance
-from .glmpca import glmpca
-import ot
-from sklearn.preprocessing import MinMaxScaler
+from cdlib import algorithms
+from cdlib.utils import convert_graph_formats
+from typing import Sequence,Optional
+import numpy as np
+import torch
+import scipy.sparse as sp
+from torch_geometric.data import Data
+from torch_geometric.utils import to_networkx
+import anndata as ad
+import scanpy as sc
+import pandas as pd
+from annoy import AnnoyIndex
+import hnswlib
+import os
+from joblib import Parallel, delayed
+import itertools
+import random
+from typing import List
+
+from sklearn.neighbors import NearestNeighbors,kneighbors_graph
 import scipy
+
+import rpy2.robjects as robjects
+import rpy2.robjects.numpy2ri
+
+def mclust_R(adata, num_cluster, modelNames='EII', used_obsm='spamc', random_seed=42):
+    """
+    Clustering using the mclust algorithm.
+    The parameters are the same as those in the R package mclust.
+    """
+
+    np.random.seed(random_seed)
+    # import rpy2.robjects as robjects
+    robjects.r.library("mclust")
+
+    # import rpy2.robjects.numpy2ri
+    rpy2.robjects.numpy2ri.activate()
+    r_random_seed = robjects.r['set.seed']
+    r_random_seed(random_seed)
+    rmclust = robjects.r['Mclust']
+
+    res = rmclust(adata.obsm[used_obsm], num_cluster, modelNames)
+    mclust_res = np.array(res[-2])
+
+    adata.obs['mclust'] = mclust_res
+    adata.obs['mclust'] = adata.obs['mclust'].astype('int')
+    adata.obs['mclust'] = adata.obs['mclust'].astype('category')
+    
+def match_cluster_labels(true_labels,est_labels):
+    true_labels_arr = np.array(list(true_labels))
+    est_labels_arr = np.array(list(est_labels))
+    org_cat = list(np.sort(list(pd.unique(true_labels))))
+    est_cat = list(np.sort(list(pd.unique(est_labels))))
+    B = nx.Graph()
+    B.add_nodes_from([i+1 for i in range(len(org_cat))], bipartite=0)
+    B.add_nodes_from([-j-1 for j in range(len(est_cat))], bipartite=1)
+    for i in range(len(org_cat)):
+        for j in range(len(est_cat)):
+            weight = np.sum((true_labels_arr==org_cat[i])* (est_labels_arr==est_cat[j]))
+            B.add_edge(i+1,-j-1, weight=-weight)
+    match = nx.algorithms.bipartite.matching.minimum_weight_full_matching(B)
+#     match = minimum_weight_full_matching(B)
+    if len(org_cat)>=len(est_cat):
+        return np.array([match[-est_cat.index(c)-1]-1 for c in est_labels_arr])
+    else:
+        unmatched = [c for c in est_cat if not (-est_cat.index(c)-1) in match.keys()]
+        l = []
+        for c in est_labels_arr:
+            if (-est_cat.index(c)-1) in match: 
+                l.append(match[-est_cat.index(c)-1]-1)
+            else:
+                l.append(len(org_cat)+unmatched.index(c))
+        return np.array(l)
 
 def batch_entropy_mixing_score(data, batches, n_neighbors=100, n_pools=100, n_samples_per_pool=100):
     """
@@ -116,24 +169,320 @@ def calc_frac_idx(x1_mat,x2_mat):
 
     return fracs,x
 
-def validate_sparse_labels(Y):
-    if not zero_indexed(Y):
-        raise ValueError('Ensure that your labels are zero-indexed')
-    if not consecutive_indexed(Y):
-        raise ValueError('Ensure that your labels are indexed consecutively')
+def visualize_embeddings(
+    combined_adata: ad.AnnData,
+    embedding: np.ndarray,
+    reconstruct_gene:np.ndarray=None,
+    true_label_key :str=None,
+    embedding_key: str = "tacos",
+    
+    spatial_key: str = "spatial",
 
-def zero_indexed(Y):
-    if min(abs(Y)) != 0:
-        return False
-    return True
+    random_state: int = 666,
+    fontsize: int = 10
+) -> ad.AnnData:
+    """Create visualization-ready AnnData from embeddings
+    
+    Args:
+        combined_adata: Original combined AnnData object with metadata
+        embedding: 2D numpy array of embeddings (cells x dimensions)
+        embedding_key: Key name for storing embeddings in obsm (default: 'tacos')
+        spatial_key: Key name for spatial coordinates in obsm (default: 'spatial')
+        random_state: Random seed for reproducibility (default: 666)
+
+        
+    
+    Returns:
+        New AnnData object containing embeddings and visualization results
+    """
+    # Create new AnnData for embeddings
+    embedding_df = pd.DataFrame(embedding, index=combined_adata.obs.index)
+    if reconstruct_gene is None:
+        adata_emb = ad.AnnData(
+            X=combined_adata.X,  # Store embeddings in X
+            obs=combined_adata.obs.copy(),
+            var = combined_adata.var.copy()
+        )
+    else:
+        print('use reconstructed genes')
+        adata_emb = ad.AnnData(
+            X=reconstruct_gene,  # Store embeddings in X
+            obs=combined_adata.obs.copy(),
+            var = combined_adata.var.copy()
+        )
+    
+    # Preserve spatial coordinates and store embeddings in obsm
+    adata_emb.obsm[spatial_key] = combined_adata.obsm[spatial_key]
+    adata_emb.obsm[embedding_key] = embedding_df.values
+    
+    # Compute neighborhood graph and UMAP
+    sc.pp.neighbors(adata_emb, use_rep=embedding_key, random_state=random_state)
+    sc.tl.umap(adata_emb, random_state=random_state)
+    
+    # # Configure plot settings
+
+    sc.pl.umap(adata_emb, color=['batch'])
+    if true_label_key is not None:
+        sc.pl.umap(adata_emb, color=[true_label_key])
+
+    # Compute PAGA analysis
+    if true_label_key is not None:
+        sc.tl.paga(adata_emb, groups=true_label_key)
+        sc.pl.paga(
+            adata_emb, 
+            color=[true_label_key], 
+            fontsize=fontsize,
+            show=False
+        )
+
+    
+    return adata_emb
 
 
-def consecutive_indexed(Y):
-    """ Assumes that Y is zero-indexed. """
-    n_classes = len(np.unique(Y[Y != np.array(-1)]))
-    if max(Y) >= n_classes:
-        return False
-    return True
+
+def integrate_datasets(
+    adata_list: List[sc.AnnData], 
+    sample_ids: List[str]
+) -> sc.AnnData:
+    """Integrate multiple AnnData objects with common features
+    
+    Args:
+        adata_list: List of processed AnnData objects
+        sample_ids: Corresponding sample IDs for batch labeling
+    
+    Returns:
+        Concatenated AnnData with aligned features
+    """
+    # Find common genes across all samples
+    common_genes = set(adata_list[0].var_names)
+    for adata in adata_list[1:]:
+        common_genes.intersection_update(adata.var_names)
+    print(f"Common genes across datasets: {len(common_genes)}")
+    
+    # Align and concatenate
+    aligned_data = []
+    for adata, sample in zip(adata_list, sample_ids):
+        # Subset to common genes and clean metadata
+        adata_ = adata[:, list(common_genes)].copy()
+        adata_ = adata_[~adata_.obs.isna().any(axis=1)]  # Remove NA observations
+        adata_.obs['batch'] = sample  # Add batch annotation
+        aligned_data.append(adata_)
+        print(f"{sample} aligned shape: {adata_.shape}")
+    
+    return ad.concat(aligned_data, join='inner', merge='same')
+
+
+
+def process_adata(
+    adata: sc.AnnData,
+    marker_genes: List[str],
+    min_genes: int = 100,
+    min_cells: int = 50,
+    n_top_genes: int = 6000
+) -> sc.AnnData:
+    """Process single AnnData object with quality control and normalization
+    
+    Args:
+        adata: Raw AnnData object
+        marker_genes: List of genes to retain regardless of filtering
+        min_genes: Minimum genes per cell (default: 100)
+        min_cells: Minimum cells expressing a gene (default: 50)
+        n_top_genes: Number of highly variable genes to select (default: 6000)
+    
+    Returns:
+        Processed AnnData object
+    """
+    # Quality control
+    sc.pp.calculate_qc_metrics(adata, inplace=True)
+    sc.pp.filter_cells(adata, min_genes=min_genes)
+    
+    # Gene filtering with marker protection
+    initial_filter, _ = sc.pp.filter_genes(adata, min_cells=min_cells, inplace=False)
+    adata.var['filter_bool'] = initial_filter
+    adata.var.loc[marker_genes, 'filter_bool'] = True  # Override marker genes
+    adata = adata[:, adata.var['filter_bool']]
+
+    # Normalization and feature selection
+    sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=n_top_genes)
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    
+    # Ensure markers in HVG
+    adata.var.highly_variable.loc[marker_genes] = True
+    return adata[:, adata.var.highly_variable]
+
+def aug_random_mask(input_feature, drop_percent=0.2):
+    
+    node_num = input_feature.shape[1]
+    mask_num = int(node_num * drop_percent)
+    node_idx = [i for i in range(node_num)]
+    mask_idx = random.sample(node_idx, mask_num)
+    aug_feature = copy.deepcopy(input_feature)
+    zeros = torch.zeros_like(aug_feature[0][0])
+    for j in mask_idx:
+        aug_feature[0][j] = zeros
+    return aug_feature
+
+
+def aug_random_edge(input_adj, drop_percent=0.2):
+
+    percent = drop_percent / 2
+    row_idx, col_idx = input_adj.nonzero()
+
+    index_list = []
+    for i in range(len(row_idx)):
+        index_list.append((row_idx[i], col_idx[i]))
+
+    single_index_list = []
+    for i in list(index_list):
+        single_index_list.append(i)
+        index_list.remove((i[1], i[0]))
+    
+    
+    edge_num = int(len(row_idx) / 2)      # 9228 / 2
+    add_drop_num = int(edge_num * percent / 2) 
+    aug_adj = copy.deepcopy(input_adj.todense().tolist())
+
+    edge_idx = [i for i in range(edge_num)]
+    drop_idx = random.sample(edge_idx, add_drop_num)
+
+    
+    for i in drop_idx:
+        aug_adj[single_index_list[i][0]][single_index_list[i][1]] = 0
+        aug_adj[single_index_list[i][1]][single_index_list[i][0]] = 0
+    
+    '''
+    above finish drop edges
+    '''
+    node_num = input_adj.shape[0]
+    l = [(i, j) for i in range(node_num) for j in range(i)]
+    add_list = random.sample(l, add_drop_num)
+
+    for i in add_list:
+        
+        aug_adj[i[0]][i[1]] = 1
+        aug_adj[i[1]][i[0]] = 1
+    
+    aug_adj = np.matrix(aug_adj)
+    aug_adj = sp.csr_matrix(aug_adj)
+    return aug_adj
+
+
+def aug_drop_node(input_fea, input_adj, drop_percent=0.2):
+
+    input_adj = torch.tensor(input_adj.todense().tolist())
+    input_fea = input_fea.squeeze(0)
+
+    node_num = input_fea.shape[0]
+    drop_num = int(node_num * drop_percent)    # number of drop nodes
+    all_node_list = [i for i in range(node_num)]
+
+    drop_node_list = sorted(random.sample(all_node_list, drop_num))
+
+    aug_input_fea = delete_row_col(input_fea, drop_node_list, only_row=True)
+    aug_input_adj = delete_row_col(input_adj, drop_node_list)
+
+    aug_input_fea = aug_input_fea.unsqueeze(0)
+    aug_input_adj = sp.csr_matrix(np.matrix(aug_input_adj))
+
+    return aug_input_fea, aug_input_adj
+
+def aug_subgraph(input_fea, input_edge_index, drop_percent=0.2):
+    
+    row = input_edge_index[0].numpy()
+    col = input_edge_index[1].numpy()
+    data = np.ones(len(row))  # 假设每条边的权重为 1
+
+    # 创建 CSR 矩阵
+    input_adj = sp.csr_matrix((data, (row, col)), shape=(input_fea.shape[0], input_fea.shape[0]))
+    
+    # edge_attr = torch.ones(input_edge_index.shape[1])
+    # input_adj = torch.sparse_coo_tensor(input_edge_index, edge_attr, (input_fea.shape[0], input_fea.shape[0]))
+    print(1001)
+    input_adj = torch.tensor(input_adj.todense().tolist())
+    input_fea = input_fea.squeeze(0)
+    node_num = input_fea.shape[0]
+
+    all_node_list = [i for i in range(node_num)]
+    s_node_num = int(node_num * (1 - drop_percent))
+    center_node_id = random.randint(0, node_num - 1)
+    sub_node_id_list = [center_node_id]
+    all_neighbor_list = []
+    print(1002)
+
+    for i in range(s_node_num - 1):
+        
+        all_neighbor_list += torch.nonzero(input_adj[sub_node_id_list[i]], as_tuple=False).squeeze(1).tolist()
+        
+        all_neighbor_list = list(set(all_neighbor_list))
+        new_neighbor_list = [n for n in all_neighbor_list if not n in sub_node_id_list]
+        if len(new_neighbor_list) != 0:
+            new_node = random.sample(new_neighbor_list, 1)[0]
+            sub_node_id_list.append(new_node)
+        else:
+            break
+        # print(10022)
+
+    print(10022)
+    drop_node_list = sorted([i for i in all_node_list if not i in sub_node_id_list])
+
+    aug_input_fea = delete_row_col(input_fea, drop_node_list, only_row=True)
+    aug_input_adj = delete_row_col(input_adj, drop_node_list)
+
+    aug_input_fea = aug_input_fea.unsqueeze(0)
+    aug_input_adj = sp.csr_matrix(np.matrix(aug_input_adj))
+    print(1003)
+    
+    row, col = aug_input_adj.nonzero()  # 提取非零元素的行列索引
+    edge_index_reconstructed = torch.tensor([row, col])
+    # aug_input_adj = aug_input_adj.coalesce()  # 确保去重重复的边（如果有的话）
+    # aug_input_adj = aug_input_adj.indices() 
+
+    return aug_input_fea, edge_index_reconstructed
+
+
+def aug_drop_node(input_fea, input_edge_index, drop_percent=0.2):
+
+    row = input_edge_index[0].numpy()
+    col = input_edge_index[1].numpy()
+    data = np.ones(len(row))  # 假设每条边的权重为 1
+
+    # 创建 CSR 矩阵
+    input_adj = sp.csr_matrix((data, (row, col)), shape=(input_fea.shape[0], input_fea.shape[0]))
+
+    input_adj = torch.tensor(input_adj.todense().tolist())
+    input_fea = input_fea.squeeze(0)
+
+    node_num = input_fea.shape[0]
+    drop_num = int(node_num * drop_percent)    # number of drop nodes
+    all_node_list = [i for i in range(node_num)]
+
+    drop_node_list = sorted(random.sample(all_node_list, drop_num))
+
+    aug_input_fea = delete_row_col(input_fea, drop_node_list, only_row=True)
+    aug_input_adj = delete_row_col(input_adj, drop_node_list)
+
+    aug_input_fea = aug_input_fea.unsqueeze(0)
+    aug_input_adj = sp.csr_matrix(np.matrix(aug_input_adj))
+    
+    row, col = aug_input_adj.nonzero()  # 提取非零元素的行列索引
+    edge_index_reconstructed = torch.tensor([row, col])
+    # aug_input_adj = aug_input_adj.coalesce()  # 确保去重重复的边（如果有的话）
+
+    return aug_input_fea, edge_index_reconstructed
+
+
+
+def delete_row_col(input_matrix, drop_list, only_row=False):
+
+    remain_list = [i for i in range(input_matrix.shape[0]) if i not in drop_list]
+    out = input_matrix[remain_list, :]
+    if only_row:
+        return out
+    out = out[:, remain_list]
+
+    return out
+
 
 
 def nn_approx(ds1, ds2, names1, names2, knn=50):
@@ -188,6 +537,43 @@ def nn_annoy(ds1, ds2, names1, names2, knn = 20, metric='euclidean', n_trees = 5
 
     return match
 
+def mnn_multi(ds1, ds2, names1, names2, knn=20, save_on_disk=True, approx=True, n_jobs=1):
+    # print(ds1.shape)
+    # print(ds2.shape)
+    # for ds1_chunk in np.array_split(ds1, n_jobs):
+    # #     print(ds1_chunk.shape)
+    print(f'use {n_jobs} cpu')
+    if approx:
+        # 并行计算最近邻匹配
+        match1 = Parallel(n_jobs=n_jobs)(
+            delayed(nn_approx)(ds1_chunk, ds2, names1_chunk, names2, knn=knn)
+            for ds1_chunk,names1_chunk in zip( np.array_split(ds1, n_jobs),np.array_split(names1, n_jobs))
+        )
+        match1 = set().union(*match1)  # 合并结果
+        # print(match1[])
+
+        match2 = Parallel(n_jobs=n_jobs)(
+            delayed(nn_approx)(ds2_chunk, ds1, names2_chunk, names1, knn=knn)
+            for ds2_chunk,names2_chunk in zip( np.array_split(ds2, n_jobs),np.array_split(names2, n_jobs))
+        )
+        match2 = set().union(*match2)  # 合并结果
+    else:
+        match1 = Parallel(n_jobs=n_jobs)(
+            delayed(nn)(ds1_chunk, ds2, names1_chunk, names2, knn=knn)
+            for ds1_chunk,names1_chunk in zip( np.array_split(ds1, n_jobs),np.array_split(names1, n_jobs))
+        )
+        match1 = set().union(*match1)  # 合并结果
+
+        match2 = Parallel(n_jobs=n_jobs)(
+            delayed(nn)(ds2_chunk, ds1, names2_chunk, names1, knn=knn)
+            for ds2_chunk,names2_chunk in zip( np.array_split(ds2, n_jobs),np.array_split(names2, n_jobs))
+        )
+        match2 = set().union(*match2)  # 合并结果
+
+    # Compute mutual nearest neighbors
+    mutual = match1 & set([(b, a) for a, b in match2])
+
+    return mutual
 
 def mnn(ds1, ds2, names1, names2, knn = 20, save_on_disk = True, approx = True):
     if approx:
@@ -195,6 +581,7 @@ def mnn(ds1, ds2, names1, names2, knn = 20, save_on_disk = True, approx = True):
         # output KNN point for each point in ds1.  match1 is a set(): (points in names1, points in names2), the size of the set is ds1.shape[0]*knn
         match1 = nn_approx(ds1, ds2, names1, names2, knn=knn)#, save_on_disk = save_on_disk)
         # Find nearest neighbors in second direction.
+        print(type(match1))
         match2 = nn_approx(ds2, ds1, names2, names1, knn=knn)#, save_on_disk = save_on_disk)
     else:
         match1 = nn(ds1, ds2, names1, names2, knn=knn)
@@ -204,41 +591,137 @@ def mnn(ds1, ds2, names1, names2, knn = 20, save_on_disk = True, approx = True):
 
     return mutual
 
-def create_dictionary_mnn(adata, use_rep, batch_name, k = 50, save_on_disk = True, approx = True, verbose = 1, iter_comb = None):
+
+def update_mnn(adata,n_list,embedding:Optional[np.ndarray] = None,path=None,k=50,cpu=1):
+    
+
+    if embedding is None:
+        n1 = n_list[0]
+        n_rest = 0
+        for i in n_list[1:]:
+            n_rest+=i
+        n2 = n_rest
+        if os.path.isfile(path+'mg_total.npy'):
+            mg_total = np.load(path+'mg_total.npy')
+            adata.obsm['Agg']= mg_total
+            print('load agg')
+        # adata_new = adata
+        if adata.obsm.get('Agg') is None:
+            sc.pp.neighbors(adata)  #计算观测值的邻域图
+            snn1 = adata.obsp['connectivities'].todense()
+            snn1_g = snn1[0:n1,0:n1]
+            snn2_g = snn1[n1:(n1+n2),n1:(n1+n2)]
+            # detect similarity corresponding spots with similar expression the same type use MNN.
+            # MNN is computed on the spatially smoothed level
+            # based on original gene expression
+            # spatially smoothed gene expression
+            # n_neighbor = 10
+            if isinstance(adata.X, np.ndarray):
+                embedding = adata.X
+            else:
+                embedding = adata.X.todense()
+            X1 = embedding[0:n1,:].copy()
+            X2 = embedding[n1:,:].copy()
+            X1_mg = X1.copy()
+            for i in range(n1):
+                # detect non-zero of snn1_g
+                index_i = snn1_g[i,:].argsort().A[0]
+                index_i = index_i[(n1-10):n1]
+                X1_mg[i,:] = X1[index_i,:].mean(0)
+
+            X2_mg = X2.copy()
+            for i in range(n2):
+                # detect non-zero of snn1_g
+                index_i = snn2_g[i,:].argsort().A[0]
+                index_i = index_i[(n2-10):n2]
+                X2_mg[i,:] = X2_mg[index_i,:].mean(0)
+            mg_total = np.concatenate([X1_mg,X2_mg],axis=0)
+            np.save(path+'mg_total.npy', mg_total)
+            print('agg saved')
+            adata.obsm['Agg'] = mg_total
+            
+    # else:
+        
+    #     # 创建新的adata
+    #     obs = adata.obs
+    #     adata_new = ad.AnnData(embedding,obs=obs)
+    #     adata_new.obsm['Agg'] = embedding
+    # print(mg_total.shape)
+    # 创建mnn
+    # print("create_dictionary_mnn")
+    # print(adata_new)
+    mnn_dict = create_dictionary_mnn(adata, use_rep='Agg', batch_name='batch', k=k,cpu=cpu)
+    # sub_graph = mnn_matrix[0:n1, n1:] #n1*n2
+
+    return mnn_dict
+
+def get_triplet(adata,mnn_dict,batch_name = 'batch'):
+    anchor_ind = []
+    positive_ind = []
+    negative_ind = []
+    section_ids = np.array(adata.obs['batch'].unique())
+    for batch_pair in mnn_dict.keys():  # pairwise compare for multiple batches
+        batchname_list = adata.obs[batch_name][mnn_dict[batch_pair].keys()]
+        #             print("before add KNN pairs, len(mnn_dict[batch_pair]):",
+        #                   sum(adata_new.obs['batch_name'].isin(batchname_list.unique())), len(mnn_dict[batch_pair]))
+
+        cellname_by_batch_dict = dict()
+        for batch_id in range(len(section_ids)):
+            cellname_by_batch_dict[section_ids[batch_id]] = adata.obs_names[
+                adata.obs[batch_name] == section_ids[batch_id]].values
+
+        anchor_list = []
+        positive_list = []
+        negative_list = []
+        for anchor in mnn_dict[batch_pair].keys():
+            anchor_list.append(anchor)
+            ## np.random.choice(mnn_dict[batch_pair][anchor])
+            positive_spot = mnn_dict[batch_pair][anchor][0]  # select the first positive spot
+            positive_list.append(positive_spot)
+            section_size = len(cellname_by_batch_dict[batchname_list[anchor]])
+            negative_list.append(
+                cellname_by_batch_dict[batchname_list[anchor]][np.random.randint(section_size)])
+
+        batch_as_dict = dict(zip(list(adata.obs_names), range(0, adata.shape[0])))
+        anchor_ind = np.append(anchor_ind, list(map(lambda _: batch_as_dict[_], anchor_list)))
+        positive_ind = np.append(positive_ind, list(map(lambda _: batch_as_dict[_], positive_list)))
+        negative_ind = np.append(negative_ind, list(map(lambda _: batch_as_dict[_], negative_list)))
+    return anchor_ind,positive_ind,negative_ind
+
+
+
+def create_dictionary_mnn(adata, use_rep, batch_name, k = 50, save_on_disk = True, approx = True, verbose = 1, iter_comb = None,cpu = 1):
     cell_names = adata.obs_names
     batch_list = adata.obs[batch_name]
     datasets = []
     datasets_pcs = []
     cells = []
+
     for i in batch_list.unique():
         datasets.append(adata[batch_list == i])
         datasets_pcs.append(adata[batch_list == i].obsm[use_rep])
         cells.append(cell_names[batch_list == i])
-    # print(cells)
+
 
     batch_name_df = pd.DataFrame(np.array(batch_list.unique()))
-    # print(batch_name_df)
+
     mnns = dict()
     
-    iter_comb=[]
-    for i in range(1,len(cells)):
-        iter_comb.append((0,i))
-    # if iter_comb is None:
-        # iter_comb = list(itertools.combinations(range(len(cells)), 2))
-    cells_all = cells[0].tolist()
-    # print(iter_comb)
-    # print(iter_comb)
+    # iter_comb=[]
+    # for i in range(1,len(cells)):
+    #     iter_comb.append((0,i))
+    if iter_comb is None:
+        iter_comb = list(itertools.combinations(range(len(cells)), 2))
+    cells_all = cells[0].tolist() # cells index of anchor slice
+
+
     for comb in iter_comb:
-        # comb = iter_comb
-        # print(comb)
+
         i = comb[0]
         j = comb[1]
-        # print(i)
-        # print(j)
+
         key_name1 = batch_name_df.loc[comb[0]].values[0] + "_" + batch_name_df.loc[comb[1]].values[0]
         mnns[key_name1] = {} # for multiple-slice setting, the key_names1 can avoid the mnns replaced by previous slice-pair
-        # if(verbose > 0):
-        #     print('Processing datasets {}'.format((i, j)))
 
         new = list(cells[j])
         ref = list(cells[i])
@@ -246,18 +729,23 @@ def create_dictionary_mnn(adata, use_rep, batch_name, k = 50, save_on_disk = Tru
         cells_all.extend(list(cells[j]))
         
         
-
+        # print(adata[new])
         ds1 = adata[new].obsm[use_rep]
         ds2 = adata[ref].obsm[use_rep]
         names1 = new
         names2 = ref
         # if k>1，one point in ds1 may have multiple MNN points in ds2.
-        match = mnn(ds1, ds2, names1, names2, knn=k, save_on_disk = save_on_disk, approx = approx)
+        
+        if cpu==1:
+            match = mnn(ds1, ds2, names1, names2, knn=k, save_on_disk = save_on_disk, approx = approx)
+        else:
+            match = mnn_multi(ds1, ds2, names1, names2, knn=k, save_on_disk=save_on_disk, approx=approx, n_jobs=cpu)
         # print(len(match))
 
         G = nx.Graph()
         G.add_edges_from(match)
         node_names = np.array(G.nodes)
+    
         anchors = list(node_names)
         adj = nx.adjacency_matrix(G)
         tmp = np.split(adj.indices, adj.indptr[1:-1])
@@ -268,607 +756,10 @@ def create_dictionary_mnn(adata, use_rep, batch_name, k = 50, save_on_disk = Tru
             i = tmp[i]
             names = list(node_names[i])
             mnns[key_name1][key]= names
-    # print(len(mnns))
-    # print(mnns.keys())
-    # print(mnns.values())
-    
-    # cells1 = cells[0].tolist()
-    # cells2 = cells[1].tolist()
-    # for i in cells2:
-    #     cells1.append(i)
-    # cells_all = cells1
-    # len(cells_all)
-    cross_adj = np.zeros((len(cells_all), len(cells_all)))
-    key = list(mnns.keys())[0]
-    val = list(mnns.values())[0]
-    # build adj based on mnns n1*n2 (from n1 view)
-    # cross_adj = np.zeros((len(cells_all), len(cells_all)))
-    for i in range(len(mnns)):
-        key = list(mnns.keys())[i]
-        val = list(mnns.values())[i]
-        # print(len(val))
-        for s in range(len(val)):
-            need_index1 = cells_all.index(list(val.keys())[s])
-            need_index2 = []
-            for j in range(len(list(val.values())[s])):
-                need_index2.append(cells_all.index((list(val.values())[s])[j]))
-            cross_adj[need_index1, need_index2] = 1
-        cross_adj1 = cross_adj.transpose()
-        np.array_equal(cross_adj, cross_adj1)
-        
-    # for s in range(0, len(anchors)):
-    #     # detect the location of the anchors
-    #     need_index1 = cells_all.index(list(val.keys())[s])
-    #     need_index2 = []
-    #     for j in range(len(list(val.values())[s])):
-    #         need_index2.append(cells_all.index((list(val.values())[s])[j]))
 
-    #     cross_adj[need_index1, need_index2] = 1
-    # cross_adj1 = cross_adj.transpose()
-    # np.array_equal(cross_adj, cross_adj1)
-    
-    return cross_adj
+    return mnns
 
-def update_mnn(adata,n_list,embedding=None,use_partialOT=False):
-    n1 = n_list[0]
-    n_rest = 0
-    for i in n_list[1:]:
-        n_rest+=i
-    n2 = n_rest
-    if not use_partialOT:
-        if embedding is None:
-            adata_new = adata
-            if adata.obsm.get('Agg') is None:
-                sc.pp.neighbors(adata_new)  #计算观测值的邻域图
-                # sc.tl.umap(adata_new)  #使用UMAP嵌入邻域图
-                # print(adata_new)
-                snn1 = adata_new.obsp['connectivities'].todense()
-                snn1_g = snn1[0:n1,0:n1]
-                snn2_g = snn1[n1:(n1+n2),n1:(n1+n2)]
-                # detect similarity corresponding spots with similar expression the same type use MNN.
-                # MNN is computed on the spatially smoothed level
-                # based on original gene expression
-                # spatially smoothed gene expression
-                # n_neighbor = 10
-                if isinstance(adata.X, np.ndarray):
-                    embedding = adata.X
-                else:
-                    embedding = adata.X.todense()
-                X1 = embedding[0:n1,:].copy()
-                X2 = embedding[n1:,:].copy()
-                X1_mg = X1.copy()
-                for i in range(n1):
-                    # detect non-zero of snn1_g
-                    index_i = snn1_g[i,:].argsort().A[0]
-                    index_i = index_i[(n1-10):n1]
-                    X1_mg[i,:] = X1[index_i,:].mean(0)
 
-                X2_mg = X2.copy()
-                for i in range(n2):
-                    # detect non-zero of snn1_g
-                    index_i = snn2_g[i,:].argsort().A[0]
-                    index_i = index_i[(n2-10):n2]
-                    X2_mg[i,:] = X2_mg[index_i,:].mean(0)
-                mg_total = np.concatenate([X1_mg,X2_mg],axis=0)
-                adata_new.obsm['Agg'] = mg_total
-        else:
-            
-            # 创建新的adata
-            obs = adata.obs
-            adata_new = ad.AnnData(embedding,obs=obs)
-            adata_new.obsm['Agg'] = embedding
-        # print(mg_total.shape)
-        # 创建mnn
-        # print("create_dictionary_mnn")
-    
-        mnn_matrix = create_dictionary_mnn(adata_new, use_rep='Agg', batch_name='batch', k=50)
-        sub_graph = mnn_matrix[0:n1, n1:] #n1*n2
-    else:
-        if embedding is None:
-            adata_new = adata
-            # if adata.obsm.get('Agg') is None:
-            #     sc.pp.neighbors(adata)  #计算观测值的邻域图
-            #     # sc.tl.umap(adata_new)  #使用UMAP嵌入邻域图
-            #     # print(adata_new)
-            #     snn1 = adata.obsp['connectivities'].todense()
-            #     snn1_g = snn1[0:n1,0:n1]
-            #     snn2_g = snn1[n1:(n1+n2),n1:(n1+n2)]
-            #     # detect similarity corresponding spots with similar expression the same type use MNN.
-            #     # MNN is computed on the spatially smoothed level
-            #     # based on original gene expression
-            #     # spatially smoothed gene expression
-            #     # n_neighbor = 10
-            #     if isinstance(adata.X, np.ndarray):
-            #         embedding = adata.X
-            #     else:
-            #         embedding = adata.X.todense()
-            #     X1 = embedding[0:n1,:].copy()
-            #     X2 = embedding[n1:,:].copy()
-            #     X1_mg = X1.copy()
-            #     for i in range(n1):
-            #         # detect non-zero of snn1_g
-            #         index_i = snn1_g[i,:].argsort().A[0]
-            #         index_i = index_i[(n1-10):n1]
-            #         X1_mg[i,:] = X1[index_i,:].mean(0)
-
-            #     X2_mg = X2.copy()
-            #     for i in range(n2):
-            #         # detect non-zero of snn1_g
-            #         index_i = snn2_g[i,:].argsort().A[0]
-            #         index_i = index_i[(n2-10):n2]
-            #         X2_mg[i,:] = X2_mg[index_i,:].mean(0)
-            #     mg_total = np.concatenate([X1_mg,X2_mg],axis=0)
-            #     adata.obsm['Agg'] = mg_total
-            # obs = adata.obs
-            # adata_new = ad.AnnData(adata.obsm['Agg'],obs=obs)
-            
-        else:
-            scaler = MinMaxScaler()
-            normalized_embed = scaler.fit_transform(embedding)
-            obs = adata.obs
-            adata_new = ad.AnnData(normalized_embed,obs=obs)
-            adata_new.obsm['Agg'] = normalized_embed
-            
-        adata_new.obsm = adata.obsm
-        a_idx = adata_new.obs['batch'].cat.categories[0]
-        b_idx = adata_new.obs['batch'].cat.categories[1]
-        slice_a = adata_new[adata_new.obs['batch']==a_idx]
-        slice_b = adata_new[adata_new.obs['batch']==b_idx]
-        sub_graph = partial_pairwise_align(slice_a,slice_b,s=0.7)
-    return sub_graph
-
-## Covert a sparse matrix into a dense matrix
-to_dense_array = lambda X: np.array(X.todense()) if isinstance(X,sparse.csr.spmatrix) else X
-
-## Returns the data matrix or representation
-extract_data_matrix = lambda adata,rep: adata.X if rep is None else adata.obsm[rep] 
-
-def generalized_kl_divergence(X, Y):
-    """
-    Returns pairwise generalized KL divergence (over all pairs of samples) of two matrices X and Y.
-
-    param: X - np array with dim (n_samples by n_features)
-    param: Y - np array with dim (m_samples by n_features)
-
-    return: D - np array with dim (n_samples by m_samples). Pairwise generalized KL divergence matrix.
-    """
-    assert X.shape[1] == Y.shape[1], "X and Y do not have the same number of features."
-
-    log_X = np.log(X)
-    log_Y = np.log(Y)
-    X_log_X = np.matrix([np.dot(X[i], log_X[i].T) for i in range(X.shape[0])])
-    D = X_log_X.T - np.dot(X, log_Y.T)
-    sum_X = np.sum(X, axis=1)
-    sum_Y = np.sum(Y, axis=1)
-    D = (D.T - sum_X).T + sum_Y.T
-    return np.asarray(D)
-
-def kl_divergence(X, Y):
-    """
-    Returns pairwise KL divergence (over all pairs of samples) of two matrices X and Y.
-    
-    param: X - np array with dim (n_samples by n_features)
-    param: Y - np array with dim (m_samples by n_features)
-    
-    return: D - np array with dim (n_samples by m_samples). Pairwise KL divergence matrix.
-    """
-    assert X.shape[1] == Y.shape[1], "X and Y do not have the same number of features."
-    
-    X = X/X.sum(axis=1, keepdims=True)
-    Y = Y/Y.sum(axis=1, keepdims=True)
-    log_X = np.log(X)
-    log_Y = np.log(Y)
-    X_log_X = np.matrix([np.dot(X[i],log_X[i].T) for i in range(X.shape[0])])
-    D = X_log_X.T - np.dot(X,log_Y.T)
-    return np.asarray(D)
-
-def high_umi_gene_distance(X, Y, n):
-    """
-    n: number of highest umi count genes to keep
-    """
-    assert X.shape[1] == Y.shape[1], "X and Y do not have the same number of features."
-
-    joint_matrix = np.vstack((X, Y))
-    gene_umi_counts = np.sum(joint_matrix, axis=0)
-    top_indices = np.sort((-gene_umi_counts).argsort()[:n])
-    X = X[:, top_indices]
-    Y = Y[:, top_indices]
-    X += np.tile(0.01 * (np.sum(X, axis=1) / X.shape[1]), (X.shape[1], 1)).T
-    Y += np.tile(0.01 * (np.sum(Y, axis=1) / Y.shape[1]), (Y.shape[1], 1)).T
-    return kl_divergence(X, Y)
-
-def glmpca_distance(X, Y, latent_dim=30, filter=True, verbose=True):
-    """
-    param: X - np array with dim (n_samples by n_features)
-    param: Y - np array with dim (m_samples by n_features)
-    param: latent_dim - number of latent dimensions in glm-pca
-    param: filter - whether to first select genes with highest UMI counts
-    """
-    assert X.shape[1] == Y.shape[1], "X and Y do not have the same number of features."
-
-    joint_matrix = np.vstack((X, Y))
-    if filter:
-        gene_umi_counts = np.sum(joint_matrix, axis=0)
-        top_indices = np.sort((-gene_umi_counts).argsort()[:2000])
-        joint_matrix = joint_matrix[:, top_indices]
-
-    print("Starting GLM-PCA...")
-    res = glmpca(joint_matrix.T, latent_dim, penalty=1, verbose=verbose)
-    #res = glmpca(joint_matrix.T, latent_dim, fam='nb', penalty=1, verbose=True)
-    reduced_joint_matrix = res["factors"]
-    # print("GLM-PCA finished with joint matrix shape " + str(reduced_joint_matrix.shape))
-    print("GLM-PCA finished.")
-
-    X = reduced_joint_matrix[:X.shape[0], :]
-    Y = reduced_joint_matrix[X.shape[0]:, :]
-    return distance.cdist(X, Y)
-
-
-
-def gwgrad_partial(C1, C2, T, loss_fun="square_loss"):
-    """Compute the GW gradient, as one term in the FGW gradient.
-
-    Note: we can not use the trick in Peyre16 as the marginals may not sum to 1.
-
-    Parameters
-    ----------
-    C1: array of shape (n_p,n_p)
-        intra-source cost matrix
-
-    C2: array of shape (n_q,n_q)
-        intra-target cost matrix
-
-    T : array of shape(n_p, n_q)
-        Transport matrix
-
-    loss_fun
-
-    Returns
-    -------
-    numpy.array of shape (n_p, n_q)
-        gradient
-    """
-    if loss_fun == 'square_loss':
-        def f1(a):
-            return (a**2)
-
-        def f2(b):
-            return (b**2)
-
-        def h1(a):
-            return a
-
-        def h2(b):
-            return 2 * b
-    elif loss_fun == 'kl_loss':
-        def f1(a):
-            return a * np.log(a + 1e-15) - a
-
-        def f2(b):
-            return b
-
-        def h1(a):
-            return a
-
-        def h2(b):
-            return np.log(b + 1e-15)
-
-    #cC1 = np.dot(C1 ** 2 / 2, np.dot(T, np.ones(C2.shape[0]).reshape(-1, 1)))
-    A = np.dot(
-        f1(C1),
-        np.dot(T, np.ones(C2.shape[0]).reshape(-1, 1))
-    )
-
-    #cC2 = np.dot(np.dot(np.ones(C1.shape[0]).reshape(1, -1), T), C2 ** 2 / 2)
-    B = np.dot(
-        np.dot(np.ones(C1.shape[0]).reshape(1, -1), T),
-        f2(C2).T
-    )  # does f2(C2) here need transpose?
-
-    constC = A + B
-    #C = -np.dot(C1, T).dot(C2.T)
-    C = -np.dot(h1(C1), T).dot(h2(C2).T)
-    tens = constC + C
-    return tens * 2
-
-
-def gwloss_partial(C1, C2, T, loss_fun='square_loss'):
-    g = gwgrad_partial(C1, C2, T, loss_fun) * 0.5
-    return np.sum(g * T)
-
-
-def wloss(M, T):
-    return np.sum(M * T)
-
-
-def fgwloss_partial(alpha, M, C1, C2, T, loss_fun='square_loss'):
-    return (1 - alpha) * wloss(M, T) + alpha * gwloss_partial(C1, C2, T, loss_fun)
-
-def fgwgrad_partial(alpha, M, C1, C2, T, loss_fun='square_loss'):
-    return (1 - alpha) * M + alpha * gwgrad_partial(C1, C2, T, loss_fun)
-
-
-
-
-def partial_fused_gromov_wasserstein(M, C1, C2, p, q, alpha, m=None, G0=None, loss_fun='square_loss', armijo=False, log=False, verbose=False, numItermax=1000, tol=1e-7, stopThr=1e-9, stopThr2=1e-9):
-    if m is None:
-        # m = np.min((np.sum(p), np.sum(q)))
-        raise ValueError("Parameter m is not provided.")
-    elif m < 0:
-        raise ValueError("Problem infeasible. Parameter m should be greater"
-                         " than 0.")
-    elif m > np.min((np.sum(p), np.sum(q))):
-        raise ValueError("Problem infeasible. Parameter m should lower or"
-                         " equal to min(|p|_1, |q|_1).")
-
-    if G0 is None:
-        G0 = np.outer(p, q)
-
-    nb_dummies = 1
-    dim_G_extended = (len(p) + nb_dummies, len(q) + nb_dummies)
-    q_extended = np.append(q, [(np.sum(p) - m) / nb_dummies] * nb_dummies)
-    p_extended = np.append(p, [(np.sum(q) - m) / nb_dummies] * nb_dummies)
-
-    cpt = 0
-    err = 1
-
-    if log:
-        log = {'err': [], 'loss': []}
-    f_val = fgwloss_partial(alpha, M, C1, C2, G0, loss_fun)
-    if verbose:
-        print('{:5s}|{:12s}|{:8s}|{:8s}'.format(
-            'It.', 'Loss', 'Relative loss', 'Absolute loss') + '\n' + '-' * 48)
-        print('{:5d}|{:8e}|{:8e}|{:8e}'.format(cpt, f_val, 0, 0))
-        #print_fgwloss_partial(alpha, M, C1, C2, G0, loss_fun)
-
-    # while err > tol and cpt < numItermax:
-    while cpt < numItermax:
-        Gprev = np.copy(G0)
-        old_fval = f_val
-
-        gradF = fgwgrad_partial(alpha, M, C1, C2, G0, loss_fun)
-        gradF_emd = np.zeros(dim_G_extended)
-        gradF_emd[:len(p), :len(q)] = gradF
-        gradF_emd[-nb_dummies:, -nb_dummies:] = np.max(gradF) * 1e2
-        gradF_emd = np.asarray(gradF_emd, dtype=np.float64)
-
-        Gc, logemd = ot.lp.emd(p_extended, q_extended, gradF_emd, numItermax=1000000, log=True)
-        if logemd['warning'] is not None:
-            raise ValueError("Error in the EMD resolution: try to increase the"
-                             " number of dummy points")
-
-        G0 = Gc[:len(p), :len(q)]
-
-        if cpt % 10 == 0:  # to speed up the computations
-            err = np.linalg.norm(G0 - Gprev)
-            if log:
-                log['err'].append(err)
-
-        deltaG = G0 - Gprev
-
-        if not armijo:
-            a = alpha * gwloss_partial(C1, C2, deltaG, loss_fun)
-            b = (1 - alpha) * wloss(M, deltaG) + 2 * alpha * np.sum(gwgrad_partial(C1, C2, deltaG, loss_fun) * 0.5 * Gprev)
-            # c = (1 - alpha) * wloss(M, Gprev) + alpha * gwloss_partial(C1, C2, Gprev, loss_fun)
-            c = fgwloss_partial(alpha, M, C1, C2, Gprev, loss_fun)
-
-            gamma = ot.optim.solve_1d_linesearch_quad(a, b)
-            # gamma = ot.optim.solve_1d_linesearch_quad(a, b, c)
-            # f_val = a * gamma ** 2 + b * gamma + c
-        else:
-            def f(x, alpha, M, C1, C2, lossfunc):
-                return fgwloss_partial(alpha, M, C1, C2, x, lossfunc)
-            xk = Gprev
-            pk = deltaG
-            gfk = fgwgrad_partial(alpha, M, C1, C2, xk, loss_fun)
-            old_val = fgwloss_partial(alpha, M, C1, C2, xk, loss_fun)
-            args = (alpha, M, C1, C2, loss_fun)
-            gamma, fc, fa = ot.optim.line_search_armijo(f, xk, pk, gfk, old_val, args)
-            # f_val = f(xk + gamma * pk, alpha, M, C1, C2, loss_fun)
-
-        if gamma == 0:
-            cpt = numItermax
-        G0 = Gprev + gamma * deltaG
-        f_val = fgwloss_partial(alpha, M, C1, C2, G0, loss_fun)
-        cpt += 1
-
-        # TODO: better stopping criteria?
-        abs_delta_fval = abs(f_val - old_fval)
-        relative_delta_fval = abs_delta_fval / abs(f_val)
-        if relative_delta_fval < stopThr or abs_delta_fval < stopThr2:
-            cpt = numItermax
-        if log:
-            log['loss'].append(f_val)
-        if verbose:
-            # if cpt % 20 == 0:
-            #     print('{:5s}|{:12s}|{:8s}|{:8s}'.format(
-            #         'It.', 'Loss', 'Relative loss', 'Absolute loss') + '\n' + '-' * 48)
-            print('{:5d}|{:8e}|{:8e}|{:8e}'.format(cpt, f_val, relative_delta_fval, abs_delta_fval))
-            #print_fgwloss_partial(alpha, M, C1, C2, G0, loss_fun)
-
-    if log:
-        log['partial_fgw_cost'] = fgwloss_partial(alpha, M, C1, C2, G0, loss_fun)
-        return G0[:len(p), :len(q)], log
-    else:
-        return G0[:len(p), :len(q)]
-
-def partial_pairwise_align(sliceA, sliceB, s, alpha=0.1, armijo=False, dissimilarity='glmpca', use_rep=None, G_init=None, a_distribution=None,
-                   b_distribution=None, norm=True, return_obj=False, verbose=True):
-    """
-    Calculates and returns optimal *partial* alignment of two slices.
-
-    param: sliceA - AnnData object
-    param: sliceB - AnnData object
-    param: s - Amount of mass to transport; Overlap percentage between the two slices. Note: 0 ≤ s ≤ 1
-    param: alpha - Alignment tuning parameter. Note: 0 ≤ alpha ≤ 1
-    param: armijo - Whether or not to use armijo (approximate) line search during conditional gradient optimization of Partial-FGW. Default is to use exact line search.
-    param: dissimilarity - Expression dissimilarity measure: 'kl' or 'euclidean' or 'glmpca'. Default is glmpca.
-    param: use_rep - If none, uses slice.X to calculate dissimilarity between spots, otherwise uses the representation given by slice.obsm[use_rep]
-    param: G_init - initial mapping to be used in Partial-FGW OT, otherwise default is uniform mapping
-    param: a_distribution - distribution of sliceA spots (1-d numpy array), otherwise default is uniform
-    param: b_distribution - distribution of sliceB spots (1-d numpy array), otherwise default is uniform
-    param: norm - scales spatial distances such that maximum spatial distance is equal to maximum gene expression dissimilarity
-    param: return_obj - returns objective function value if True, nothing if False
-
-    return: pi - partial alignment of spots
-    return: log['fgw_dist'] - objective function output of FGW-OT
-    """
-    m = s
-    print("partial OT starts...")
-
-    # subset for common genes
-    # common_genes = intersect(sliceA.var.index, sliceB.var.index)
-    # sliceA = sliceA[:, common_genes]
-    # sliceB = sliceB[:, common_genes]
-    # print('Filtered all slices for common genes. There are ' + str(len(common_genes)) + ' common genes.')
-
-    # Calculate spatial distances
-    D_A = distance.cdist(sliceA.obsm['spatial'], sliceA.obsm['spatial'])
-    D_B = distance.cdist(sliceB.obsm['spatial'], sliceB.obsm['spatial'])
-
-    # Calculate expression dissimilarity
-    A_X, B_X = to_dense_array(extract_data_matrix(sliceA, use_rep)), to_dense_array(extract_data_matrix(sliceB, use_rep))
-    if dissimilarity.lower() == 'euclidean' or dissimilarity.lower() == 'euc':
-        M = distance.cdist(A_X, B_X)
-    elif dissimilarity.lower() == 'gkl':
-        s_A = A_X + 0.01
-        s_B = B_X + 0.01
-        M = generalized_kl_divergence(s_A, s_B)
-        M /= M[M > 0].max()
-        M *= 10
-    elif dissimilarity.lower() == 'kl':
-        s_A = A_X + 0.01
-        s_B = B_X + 0.01
-        M = kl_divergence(s_A, s_B)
-    elif dissimilarity.lower() == 'selection_kl':
-        M = high_umi_gene_distance(A_X, B_X, 2000)
-    # elif dissimilarity.lower() == "pca":
-    #     M = pca_distance(sliceA, sliceB, 2000, 20)
-    elif dissimilarity.lower() == 'glmpca':
-        M = glmpca_distance(A_X, B_X, latent_dim=30, filter=True, verbose=verbose)
-    else:
-        print("ERROR")
-        exit(1)
-
-    # init distributions
-    if a_distribution is None:
-        a = np.ones((sliceA.shape[0],)) / sliceA.shape[0]
-    else:
-        a = a_distribution
-
-    if b_distribution is None:
-        b = np.ones((sliceB.shape[0],)) / sliceB.shape[0]
-    else:
-        b = b_distribution
-
-    if norm:
-        D_A /= D_A[D_A > 0].min().min()
-        D_B /= D_B[D_B > 0].min().min()
-
-        """
-        Code for normalizing distance matrix
-        """
-        D_A /= D_A[D_A>0].max()
-        #D_A *= 10
-        D_A *= M.max()
-        D_B /= D_B[D_B>0].max()
-        #D_B *= 10
-        D_B *= M.max()
-        """
-        Code for normalizing distance matrix ends
-        """
-    pi, log = partial_fused_gromov_wasserstein(M, D_A, D_B, a, b, alpha=alpha, m=m, G0=G_init, loss_fun='square_loss', armijo=armijo, log=True, verbose=verbose,numItermax=50)
-
-    if return_obj:
-        return pi, log['partial_fgw_cost']
-    return pi
-
-def graph_alpha(spatial_locs, n_neighbors=10):
-        """
-        Construct a geometry-aware spatial proximity graph of the spatial spots of cells by using alpha complex.
-        :param adata: the annData object for spatial transcriptomics data with adata.obsm['spatial'] set to be the spatial locations.
-        :type adata: class:`anndata.annData`
-        :param n_neighbors: the number of nearest neighbors for building spatial neighbor graph based on Alpha Complex
-        :type n_neighbors: int, optional, default: 10
-        :return: a spatial neighbor graph
-        :rtype: class:`scipy.sparse.csr_matrix`
-        """
-        A_knn = kneighbors_graph(spatial_locs, n_neighbors=n_neighbors, mode='distance')
-        estimated_graph_cut = A_knn.sum() / float(A_knn.count_nonzero())
-        spatial_locs_list = spatial_locs.tolist()
-        n_node = len(spatial_locs_list)
-        alpha_complex = gudhi.AlphaComplex(points=spatial_locs_list)
-        simplex_tree = alpha_complex.create_simplex_tree(max_alpha_square=estimated_graph_cut ** 2)
-        skeleton = simplex_tree.get_skeleton(1)
-        initial_graph = nx.Graph()
-        initial_graph.add_nodes_from([i for i in range(n_node)])
-        for s in skeleton:
-            if len(s[0]) == 2:
-                initial_graph.add_edge(s[0][0], s[0][1])
-
-        extended_graph = nx.Graph()
-        extended_graph.add_nodes_from(initial_graph)
-        extended_graph.add_edges_from(initial_graph.edges)
-
-        # Remove self edges
-        for i in range(n_node):
-            try:
-                extended_graph.remove_edge(i, i)
-            except:
-                pass
-
-        return nx.to_scipy_sparse_array(extended_graph, format='csr')
-
-def sparse_mx_to_torch_edge_list(sparse_mx):
-    sparse_mx = sparse_mx.tocoo().astype(np.float32)
-    edge_list = torch.from_numpy(
-        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
-    return edge_list
-
-def build_graph_G(data,n_list,use_cor = True):
-    n_total = sum(n_list)
-    arr_total = np.zeros((n_total,n_total))
-    
-    flag = 0
-    for n in n_list:
-        data_slice = torch.from_numpy(data[flag:flag+n,])
-        if use_cor:
-            spatial_graph = graph_alpha(data_slice).toarray()
-        else:
-            spatial_graph = kneighbors_graph(data_slice, n_neighbors=10, mode='distance').toarray()
-        #spatial_graph = graph_alpha(cor).toarray()
-        
-        arr_total[flag:flag+n,flag:flag+n] = spatial_graph[:n, :n]
-        flag+=n
-        
-    
-    # n1 = n_list[0]
-    # n_rest = 0
-    # for i in n_list[1:]:
-    #     n_rest+=i
-    # cor1 = torch.from_numpy(cor_cat[:n1,])
-    # cor2 = torch.from_numpy(cor_cat[n1:,])
-    # spatial_graph1 = graph_alpha(cor1)
-    # spatial_graph2 = graph_alpha(cor2)
-    # righttop = np.zeros((n1,n_rest))
-    # leftbottem = np.zeros((n_rest,n1))
-    # first_row = np.hstack((spatial_graph1.toarray(),righttop))  #横向合并
-    # second_row = np.hstack((leftbottem,spatial_graph2.toarray()))  #横向合并
-    # whole_graph = np.vstack((first_row,second_row))  #纵向合并
-    # spatial_graph = sparse.csr_matrix(whole_graph)
-    spatial_graph = sparse.csr_matrix(arr_total)
-    
-    edge_list_ = sparse_mx_to_torch_edge_list(spatial_graph)
-    edge_list = edge_list_.numpy()
-    #edge_list = sparse_mx_to_torch_edge_list(self.spatial_graph).to(device)
-    edge_tuple_list = []
-    for i in range(edge_list.shape[1]):
-        edge_tuple_list.append((edge_list[0,i],edge_list[1,i]))
-    G = nx.Graph()
-    # G.add_nodes_from([i for i in range(whole_graph.shape[0])])
-    G.add_nodes_from([i for i in range(arr_total.shape[0])])
-    G.add_edges_from(edge_tuple_list)
-    return G,edge_list_
 
 def transition(communities: Sequence[Sequence[int]],
                num_nodes: int) -> np.ndarray:
@@ -876,6 +767,25 @@ def transition(communities: Sequence[Sequence[int]],
     for i, node_list in enumerate(communities):
         classes[np.asarray(node_list)] = i
     return classes
+
+def community_detection(name):
+    algs = {
+        # non-overlapping algorithms
+        'louvain': algorithms.louvain,
+        'combo': algorithms.pycombo,
+        'leiden': algorithms.leiden,
+        'ilouvain': algorithms.ilouvain,
+        # 'edmot': algorithms.edmot,
+        'eigenvector': algorithms.eigenvector,
+        'girvan_newman': algorithms.girvan_newman,
+        # overlapping algorithms
+        'demon': algorithms.demon,
+        'lemon': algorithms.lemon,
+        # 'ego-splitting': algorithms.egonet_splitter,
+        # 'nnsed': algorithms.nnsed,
+        'lpanni': algorithms.lpanni,
+    }
+    return algs[name]
 
 def community_strength(graph: nx.Graph,
                        communities: Sequence[Sequence[int]]) -> (np.ndarray, np.ndarray):
@@ -919,13 +829,161 @@ def get_edge_weight(edge_index: torch.Tensor,
     edge_weight = normalize(edge_weight)
     return torch.from_numpy(edge_weight).to(edge_index.device)
 
-def get_node_cs_edge_weight(G,edge_list):
-    communities = algorithms.leiden(G).communities
+def transition(communities: Sequence[Sequence[int]],
+               num_nodes: int) -> np.ndarray:
+    classes = np.full(num_nodes, -1)
+    for i, node_list in enumerate(communities):
+        classes[np.asarray(node_list)] = i
+    return classes
 
-    com = transition(communities, G.number_of_nodes())
-    com_cs, node_cs = community_strength(G, communities)
-    # edge_index = torch.from_numpy(edge_list)
-    edge_weight = get_edge_weight(edge_list, com, com_cs)
-    com_size = [len(c) for c in communities]
-    print(f'Done! {len(com_size)} communities detected. \n')
-    return edge_weight,node_cs
+def community_augmentation(expression, edge_index, detect_method):
+    n_nodes = len(expression)
+    data = Data(x=expression, edge_index=edge_index)
+    g = to_networkx(data, to_undirected=True)
+    print('detecting communities...')
+    coms = community_detection(detect_method)(g).communities
+    com_str, node_str = community_strength(g, coms)
+    com_groups = transition(coms, n_nodes)
+    com_sz = [len(com) for com in coms]
+    print('{} communities found!'.format(len(com_sz)))
+    edge_weight = get_edge_weight(edge_index, com_groups, com_str)
+    
+    return edge_weight, node_str
+
+
+
+def merge_csr_graphs(csr_matrices):
+    num_nodes = 0
+    rows = []
+    cols = []
+    data = []
+    
+    for csr in csr_matrices:
+        num_nodes_csr = csr.shape[0]
+        rows_csr, cols_csr = csr.nonzero()
+        data_csr = csr.data
+        
+        rows.extend(rows_csr + num_nodes)
+        cols.extend(cols_csr + num_nodes)
+        data.extend(data_csr)
+        
+        num_nodes += num_nodes_csr
+    
+    combined_csr = sp.csr_matrix((data, (rows, cols)), shape=(num_nodes, num_nodes))
+    return combined_csr
+
+
+def construct_graph(data,num_list,n_neighbors: int = 15):
+    # print('construct graphs...') 
+    # n_total = sum(num_list)
+    # arr_total = np.zeros((n_total,n_total))
+    flag = 0
+    graph_list = []
+    for n in num_list:
+        data_slice = torch.from_numpy(data[flag:flag+n,])
+        if data.shape[1]==2:
+            spatial_graph = graph_alpha(data_slice,n_neighbors=n_neighbors)
+            # print(type(spatial_graph))
+        else:
+            spatial_graph = kneighbors_graph(data_slice, n_neighbors=10, mode='distance')
+            # print(type(spatial_graph))
+        graph_list.append(spatial_graph) 
+        
+        # print(type(spatial_graph))
+        flag+=n
+
+    return graph_list
+
+def normalize_adj(adj):
+    # normalize adjacency matrix by D^-1/2 * A * D^-1/2,in order to apply to gcn conv
+
+    if not np.array_equal(np.array(adj.todense()).transpose(), np.array(adj.todense())):
+        raise AttributeError('adj matrix should be symmetrical!')
+    adj = adj.tocoo()
+    rowsum = np.array(adj.sum(1))
+    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+    d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
+    return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
+
+
+def sparse_mx_to_torch_sparse_tensor(sparse_mx):
+    # Convert a scipy sparse matrix to a torch sparse tensor.
+    sparse_mx = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(
+        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
+    values = torch.from_numpy(sparse_mx.data)
+    shape = torch.Size(sparse_mx.shape)
+    return torch.sparse.FloatTensor(indices, values, shape)
+
+
+def adj_to_edge_index(adj):
+    n_nodes = int(adj.shape[0])
+    # out = torch.tensor([i for i in range(n_nodes)]).unsqueeze(0)
+    # self_loop = torch.cat([out,out],dim=0)
+    if isinstance(adj, np.ndarray):
+        adj = torch.from_numpy(adj)
+        edge_index = adj.nonzero().t()
+        # edge_index = torch.cat([edge_index,self_loop],dim=1)
+
+    elif isinstance(adj, sp.csr_matrix):
+        adj = adj.tocoo().astype(np.float32)
+        edge_index = torch.from_numpy(
+            np.vstack((adj.row, adj.col)).astype(np.int64))
+        # edge_index = torch.cat([edge_index, self_loop], dim=1)
+    else:
+        raise TypeError("unsupported adj type !")
+    return edge_index
+
+
+def graph_alpha(spatial_locs, n_neighbors=15):
+        """
+        Construct a geometry-aware spatial proximity graph of the spatial spots of cells by using alpha complex.
+        :param adata: the annData object for spatial transcriptomics data with adata.obsm['spatial'] set to be the spatial locations.
+        :type adata: class:`anndata.annData`
+        :param n_neighbors: the number of nearest neighbors for building spatial neighbor graph based on Alpha Complex
+        :type n_neighbors: int, optional, default: 10
+        :return: a spatial neighbor graph
+        :rtype: class:`scipy.sparse.csr_matrix`
+        """
+        A_knn = kneighbors_graph(spatial_locs, n_neighbors=n_neighbors, mode='distance')
+        estimated_graph_cut = A_knn.sum() / float(A_knn.count_nonzero())
+        spatial_locs_list = spatial_locs.tolist()
+        n_node = len(spatial_locs_list)
+        alpha_complex = gudhi.AlphaComplex(points=spatial_locs_list)
+        simplex_tree = alpha_complex.create_simplex_tree(max_alpha_square=estimated_graph_cut ** 2)
+        skeleton = simplex_tree.get_skeleton(1)
+        initial_graph = nx.Graph()
+        initial_graph.add_nodes_from([i for i in range(n_node)])
+        for s in skeleton:
+            if len(s[0]) == 2:
+                initial_graph.add_edge(s[0][0], s[0][1])
+
+        extended_graph = nx.Graph()
+        extended_graph.add_nodes_from(initial_graph)
+        extended_graph.add_edges_from(initial_graph.edges)
+
+        # Remove self edges
+        for i in range(n_node):
+            try:
+                extended_graph.remove_edge(i, i)
+            except:
+                pass
+        
+        edge_cnt = len(extended_graph.edges())
+        nodes = np.ones(edge_cnt)
+        rows = []
+        cols = []
+        for edge in extended_graph.edges():
+            row, col = edge
+            rows.append(row)
+            cols.append(col)
+
+        spa_graph_sp_mx = sp.csr_matrix((nodes, (rows, cols)), shape=(n_node, n_node), dtype=int)
+        # symmetrical adj
+        spa_graph_sp_mx += spa_graph_sp_mx.transpose()
+        spa_graph_sp_mx.data[spa_graph_sp_mx.data == 2] = 1
+        return spa_graph_sp_mx
+        
+        
+        # return nx.to_scipy_sparse_array(extended_graph, format='csr')
